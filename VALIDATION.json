@@ -1,0 +1,16 @@
+{
+  "python_syntax": "passed",
+  "rule_cases": 12,
+  "normalization_cases": 2,
+  "payload_rebuild_and_metadata_checks": "passed",
+  "duplicate_key_cases": 2,
+  "routing_cases": 7,
+  "audit_text_absence": "passed",
+  "integration_tests_packaged": 12,
+  "not_executed": [
+    "Docker build",
+    "FastAPI integration tests",
+    "live model API",
+    "live Yandex API"
+  ]
+}

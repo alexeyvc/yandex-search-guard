@@ -1,0 +1,14 @@
+# Merge into your existing OWUI Compose; do not replace other settings/networks.
+services:
+  open-webui:
+    environment:
+      ENABLE_WEB_SEARCH: "True"
+      WEB_SEARCH_ENGINE: "yandex"
+      YANDEX_WEB_SEARCH_URL: "http://search-guard:8000/v2/web/search"
+      YANDEX_WEB_SEARCH_API_KEY: "REPLACE_WITH_SEARCH_TOKEN_NOT_REAL_YANDEX_KEY"
+      YANDEX_WEB_SEARCH_CONFIG: '{"query":{"searchType":"SEARCH_TYPE_RU"}}'
+    networks:
+      - ai-egress
+networks:
+  ai-egress:
+    external: true

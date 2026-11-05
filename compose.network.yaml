@@ -1,0 +1,7 @@
+services:
+  search-guard:
+    networks:
+      - ai-egress
+networks:
+  ai-egress:
+    external: true
