@@ -1,3 +1,17 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/data/
+/backups/
+/wheelhouse/
+*.zip
+/yandex-search-guard-sources*.txt
+/output/
