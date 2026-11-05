@@ -1,5 +1,5 @@
 <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Yandex Search Guard</title>
-<style>body{font:16px system-ui;max-width:1050px;margin:30px auto;padding:0 20px;background:#101827;color:#dce7f7}section{background:#1c293c;padding:20px;margin:18px 0;border-radius:12px}h1,h2{color:#9acbff}label{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;background:#101827;color:#fff;border:1px solid #53647d;padding:10px;border-radius:5px}textarea{min-height:85px}button{background:#397dc6;color:white;padding:11px 16px;border:0;border-radius:5px;margin:5px;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;font-size:13px;text-align:left}td,th{border-bottom:1px solid #46556a;padding:6px}small{color:#b6c8dc}</style>
+<style>body{font:16px system-ui;max-width:1050px;margin:30px auto;padding:0 20px;background:#101827;color:#dce7f7}section{background:#1c293c;padding:20px;margin:18px 0;border-radius:12px}h1,h2{color:#9acbff}label{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;background:#101827;color:#fff;border:1px solid #53647d;padding:10px;border-radius:5px}textarea{min-height:85px}button{background:#397dc6;color:white;padding:11px 16px;border:0;border-radius:5px;margin:5px;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;font-size:13px;text-align:left}td,th{border-bottom:1px solid #46556a;padding:6px}small{color:#b6c8dc}td:last-child{max-width:450px}td:last-child pre{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}</style>
 <h1>Yandex Search Guard 0.2.0</h1><p>OWUI / yandex → проверка → Yandex Search API. Блокировка: HTTP 403. При ошибке модели поиск запрещён.</p><p id="status"></p>
 <section><h2>Настройки</h2><form id="form">
 <label>API base локальной модели<input id="llm_url" required></label><label>ID модели<input id="llm_model"></label><label>API key модели<input type="password" id="llm_key" autocomplete="new-password" placeholder="Пусто — сохранить прежний"></label><small id="llm_key_set"></small>
@@ -7,17 +7,37 @@
 <label>Настоящий API-ключ Яндекса<input type="password" id="yandex_key" autocomplete="new-password" placeholder="Пусто — сохранить прежний"></label><small id="yandex_key_set"></small><label>Yandex folderId<input id="folder_id"></label>
 <label>Тип поиска<select id="search_type"><option>SEARCH_TYPE_RU</option><option>SEARCH_TYPE_COM</option><option>SEARCH_TYPE_TR</option></select></label><label>Регион, например 225<input id="region"></label>
 <label><input type="checkbox" id="block_email"> Блокировать email</label><label><input type="checkbox" id="block_phone"> Блокировать телефоны / длинные номера</label><label><input type="checkbox" id="block_ip"> Блокировать непубличные IP</label>
+<label><input type="checkbox" id="log_blocked_queries"> Сохранять исходный текст отклонённых запросов (BLOCK)</label>
+<label><input type="checkbox" id="log_allow_queries"> Сохранять исходный текст разрешённых запросов (ALLOW)</label><small>Тексты сохраняются только после включения соответствующей настройки. Выключение прекращает новую запись, но не удаляет ранее сохранённое. Записи удаляются через 30 дней или раньше при достижении 10 000. Очистка — при старте, каждый час и при работе с журналом. БД и backup могут содержать персональные данные и секреты.</small>
 <label>Внутренние домены (по одному на строку)<textarea id="internal_domains"></textarea></label><label>Запрещённые подстроки (по одной на строку)<textarea id="blocked_terms"></textarea></label><label>Системная политика<textarea id="policy" style="min-height:230px"></textarea></label><button>Сохранить</button></form><p>Endpoint: <code>/v2/web/search</code>. Настоящий ключ хранится только в шлюзе. В OWUI используйте SEARCH_TOKEN.</p></section>
 <section><h2>Проверка без вызова Яндекса</h2><textarea id="query" placeholder="Сначала используйте синтетические данные"></textarea><button id="test">Проверить</button><pre id="verdict"></pre><small>Вызов модели выполняется по сохранённым настройкам. Проверьте, что API действительно локальный.</small></section>
-<section><h2>Журнал решений</h2><button id="refresh">Обновить</button><button id="clear">Очистить</button><table><thead><tr><th>Время</th><th>Источник</th><th>Решение</th><th>Код</th><th>мс</th><th>ID</th></tr></thead><tbody id="events"></tbody></table></section>
+<section><h2>Журнал решений</h2><label>Фильтр<select id="decision_filter"><option value="BLOCK" selected>Отклонённые (BLOCK)</option><option value="ALL">Все решения</option><option value="ALLOW">Разрешённые (ALLOW)</option><option value="ERROR">Ошибки (ERROR)</option></select></label><button id="refresh">Обновить</button><button id="clear">Очистить</button><table><thead><tr><th>Время</th><th>Источник</th><th>Решение</th><th>Код</th><th>мс</th><th>ID</th><th>Текст запроса</th></tr></thead><tbody id="events"></tbody></table></section>
 <script>
 const el=id=>document.getElementById(id);let fields=[];
-async function api(path,body){const r=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Guard-UI':'1'},body:body===undefined?undefined:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error('HTTP '+r.status+' '+JSON.stringify(d));return d}
+async function api(path,body){const r=await fetch('.'+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Guard-UI':'1'},body:body===undefined?undefined:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error('HTTP '+r.status+' '+JSON.stringify(d));return d}
 function status(s){el('status').textContent=s}
 async function load(){const d=await api('/api/settings');fields=Object.keys(d).filter(k=>!k.endsWith('_set'));for(const k of fields){const n=el(k);if(n.type==='checkbox')n.checked=d[k];else n.value=Array.isArray(d[k])?d[k].join('\n'):d[k]}for(const k of ['llm_key','yandex_key'])el(k+'_set').textContent=d[k+'_set']?'Ключ сохранён':'Ключ не задан'}
 el('form').onsubmit=async e=>{e.preventDefault();try{const d={};for(const k of fields){const n=el(k);d[k]=n.type==='checkbox'?n.checked:n.value}for(const k of ['internal_domains','blocked_terms'])d[k]=d[k].split('\n').map(x=>x.trim()).filter(Boolean);d.timeout=Number(d.timeout);await api('/api/settings',d);await load();status('Сохранено')}catch(e){status(e.message)}};
-async function refresh(){const rows=await api('/api/events');el('events').replaceChildren();for(const r of rows){const tr=document.createElement('tr');for(const v of [new Date(r.ts*1000).toLocaleString(),r.origin,r.decision,r.code,r.ms,r.request_id]){const td=document.createElement('td');td.textContent=v;tr.appendChild(td)}el('events').appendChild(tr)}}
+async function refresh(){
+ const rows=await api('/api/events?decision='+encodeURIComponent(el('decision_filter').value));
+ el('events').replaceChildren();
+ for(const r of rows){
+  const tr=document.createElement('tr');
+  for(const v of [new Date(r.ts*1000).toLocaleString(),r.origin,r.decision,r.code,r.ms,r.request_id]){
+   const td=document.createElement('td');td.textContent=v;tr.appendChild(td);
+  }
+  const td=document.createElement('td');
+  if((r.decision==='BLOCK'||r.decision==='ALLOW') && r.query_text!==null && r.query_text!==undefined){
+   const details=document.createElement('details');
+   const summary=document.createElement('summary');summary.textContent='Показать запрос';
+   const pre=document.createElement('pre');pre.textContent=r.query_text;
+   details.append(summary,pre);td.appendChild(details);
+  }else{td.textContent=r.decision==='ERROR'?'—':'Не сохранён';}
+  tr.appendChild(td);el('events').appendChild(tr);
+ }
+}
 el('test').onclick=async()=>{el('test').disabled=true;try{el('verdict').textContent=JSON.stringify(await api('/api/test',{query:el('query').value}),null,2);await refresh()}catch(e){status(e.message)}finally{el('test').disabled=false}};
+el('decision_filter').onchange=()=>refresh().catch(e=>status(e.message));
 el('refresh').onclick=()=>refresh().catch(e=>status(e.message));el('clear').onclick=async()=>{if(confirm('Очистить журнал?'))try{await api('/api/events/clear',{});await refresh()}catch(e){status(e.message)}};
 Promise.all([load(),refresh()]).catch(e=>status(e.message));
 </script></html>

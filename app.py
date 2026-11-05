@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
 import json
 import os
 import re
@@ -54,6 +56,8 @@ class Settings(BaseModel):
     block_email: bool = True
     block_phone: bool = True
     block_ip: bool = True
+    log_blocked_queries: bool = False
+    log_allow_queries: bool = False
     internal_domains: list[str] = Field(default_factory=lambda: ["corp.local", "internal"])
     blocked_terms: list[str] = Field(default_factory=list)
     policy: str = POLICY
@@ -95,7 +99,30 @@ class Verdict(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["ALLOW", "BLOCK"]
 
-app = FastAPI(title="Yandex Search Guard", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
+# journal-v2: periodic cleanup, even without incoming searches
+async def journal_cleanup_loop():
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await asyncio.to_thread(cleanup_events)
+            app.state.journal_cleanup_error = None
+        except Exception as exc:
+            app.state.journal_cleanup_error = type(exc).__name__
+            logging.getLogger("uvicorn.error").warning("Journal cleanup failed: %s", type(exc).__name__)
+
+@asynccontextmanager
+async def journal_lifespan(application):
+    await asyncio.to_thread(cleanup_events)
+    application.state.journal_cleanup_error = None
+    task = asyncio.create_task(journal_cleanup_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+app = FastAPI(lifespan=journal_lifespan, title="Yandex Search Guard", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
 basic = HTTPBasic()
 slots = asyncio.Semaphore(4)
 
@@ -108,6 +135,20 @@ def connect():
 conn = connect()
 conn.executescript("""CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, request_id TEXT, origin TEXT, decision TEXT, code TEXT, ms INTEGER);""")
+# blocked-log-v1
+if "rejected_query" not in {row[1] for row in conn.execute("PRAGMA table_info(events)")}:
+    conn.execute("ALTER TABLE events ADD COLUMN rejected_query TEXT")
+conn.execute("CREATE INDEX IF NOT EXISTS events_decision_id ON events(decision, id)")
+# journal-v2 schema; preserve the existing DB and migrate v1 text once
+journal_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+if "query_text" not in journal_columns:
+    conn.execute("ALTER TABLE events ADD COLUMN query_text TEXT")
+if "rejected_query" in journal_columns:
+    conn.execute("UPDATE events SET query_text=rejected_query WHERE query_text IS NULL AND rejected_query IS NOT NULL")
+    conn.execute("UPDATE events SET rejected_query=NULL WHERE rejected_query IS NOT NULL")
+conn.execute("CREATE INDEX IF NOT EXISTS events_ts ON events(ts)")
+conn.execute("CREATE INDEX IF NOT EXISTS events_decision_id ON events(decision,id)")
+conn.execute("DELETE FROM events WHERE ts < ?", (time.time() - 30 * 86400,))
 conn.commit()
 conn.close()
 
@@ -121,11 +162,16 @@ def read_settings():
         c.close()
 
 
-def record(rid, origin, decision, code, start):
+def record(rid, origin, decision, code, start, query=None):
+    settings = read_settings()
+    store_text = ((decision == "BLOCK" and settings.log_blocked_queries)
+                  or (decision == "ALLOW" and settings.log_allow_queries))
+    saved_query = query[:4096] if store_text and isinstance(query, str) else None
     c = connect()
     try:
         with c:
-            c.execute("INSERT INTO events(ts,request_id,origin,decision,code,ms) VALUES(?,?,?,?,?,?)", (time.time(), rid, origin, decision, code, int((time.monotonic()-start)*1000)))
+            c.execute("INSERT INTO events(ts,request_id,origin,decision,code,ms,query_text) VALUES(?,?,?,?,?,?,?)", (time.time(), rid, origin, decision, code, int((time.monotonic()-start)*1000), saved_query))
+            c.execute("DELETE FROM events WHERE ts < ?", (time.time() - 30 * 86400,))
             c.execute("DELETE FROM events WHERE id <= COALESCE((SELECT MAX(id)-10000 FROM events),0)")
     finally:
         c.close()
@@ -204,10 +250,14 @@ def set_settings(s: Settings):
 
 
 @app.get("/api/events", dependencies=[Depends(admin)])
-def events():
+def events(decision: Literal["ALL", "BLOCK", "ALLOW", "ERROR"] = "ALL"):
+    cleanup_events()
     c = connect()
     try:
-        return [dict(r) for r in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 200")]
+        return [dict(r) for r in c.execute(
+            "SELECT id,ts,request_id,origin,decision,code,ms,query_text FROM events WHERE (?='ALL' OR decision=?) ORDER BY id DESC LIMIT 200",
+            (decision, decision),
+        )]
     finally:
         c.close()
 
@@ -335,7 +385,11 @@ def build_yandex_body(body, text, s):
     fmt = body.get("responseFormat", "FORMAT_XML")
     if fmt not in {"FORMAT_XML", "FORMAT_HTML", "XML", "HTML"}:
         raise ValueError("Invalid responseFormat")
-    result = {"query": query, "folderId": s.folder_id, "responseFormat": fmt}
+    result = {"query": query, "responseFormat": fmt}
+    if s.folder_id:
+        if len(s.folder_id) > 50:
+            raise ValueError("folderId must have at most 50 characters")
+        result["folderId"] = s.folder_id
     if s.region:
         result["region"] = s.region
     group = body.get("groupSpec", {})
@@ -371,7 +425,7 @@ async def run_request(text, origin, body=None):
     start = time.monotonic()
     rid = uuid.uuid4().hex
     def finish(decision, code):
-        record(rid, origin, decision, code, start)
+        record(rid, origin, decision, code, start, query=text)
         return {"decision": decision, "code": code, "request_id": rid, "ms": int((time.monotonic()-start)*1000)}
     try:
         await asyncio.wait_for(slots.acquire(), timeout=2)
@@ -384,7 +438,7 @@ async def run_request(text, origin, body=None):
             return 403, None, finish("BLOCK", code)
         if body is None:
             return 200, None, finish("ALLOW", code)
-        if not s.yandex_key or not s.folder_id:
+        if not s.yandex_key:
             return 503, None, finish("BLOCK", "YANDEX_NOT_CONFIGURED")
         try:
             outbound = build_yandex_body(body, normalized, s)
@@ -415,3 +469,13 @@ async def proxy(request: Request):
     status, result, verdict = await run_request(text, "yandex", body)
     headers = {"X-Guard-Decision": verdict["decision"], "X-Guard-Code": verdict["code"], "X-Request-ID": verdict["request_id"]}
     return JSONResponse(result if status == 200 else {"error": "Search blocked or unavailable", **verdict}, status_code=status, headers=headers)
+
+
+def cleanup_events():
+    c = connect()
+    try:
+        with c:
+            c.execute("DELETE FROM events WHERE ts < ?", (time.time() - 30 * 86400,))
+            c.execute("DELETE FROM events WHERE id <= COALESCE((SELECT MAX(id)-10000 FROM events),0)")
+    finally:
+        c.close()
