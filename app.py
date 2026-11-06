@@ -17,9 +17,9 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from guard_admin import Sessions, ADMIN_FIELDS, merge_settings, event_rows, xlsx_bytes
 
 os.umask(0o077)
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -122,8 +122,7 @@ async def journal_lifespan(application):
         with suppress(asyncio.CancelledError):
             await task
 
-app = FastAPI(lifespan=journal_lifespan, title="Yandex Search Guard", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
-basic = HTTPBasic()
+app = FastAPI(lifespan=journal_lifespan, title="Yandex Search Guard", version="0.3.0", docs_url=None, redoc_url=None, openapi_url=None)
 slots = asyncio.Semaphore(4)
 
 
@@ -149,8 +148,22 @@ if "rejected_query" in journal_columns:
 conn.execute("CREATE INDEX IF NOT EXISTS events_ts ON events(ts)")
 conn.execute("CREATE INDEX IF NOT EXISTS events_decision_id ON events(decision,id)")
 conn.execute("DELETE FROM events WHERE ts < ?", (time.time() - 30 * 86400,))
+# Additive migration: keep existing search events and their text.
+for column, definition in (("event_type", "TEXT NOT NULL DEFAULT 'SEARCH'"),
+                           ("username", "TEXT")):
+    if column not in {row[1] for row in conn.execute("PRAGMA table_info(events)")}:
+        conn.execute(f"ALTER TABLE events ADD COLUMN {column} {definition}")
+conn.execute("CREATE INDEX IF NOT EXISTS events_username_id ON events(username,id)")
 conn.commit()
 conn.close()
+
+COOKIE_NAME = "search_guard_session"
+_cookie_flag = os.environ.get("SESSION_COOKIE_SECURE", "true").lower()
+if _cookie_flag not in ("true", "false"):
+    raise RuntimeError("SESSION_COOKIE_SECURE must be true or false")
+COOKIE_SECURE = _cookie_flag == "true"
+sessions = Sessions(connect, ADMIN, PASSWORD, os.environ.get("GUARD_USERS_JSON", ""),
+                    os.environ.get("SESSION_HOURS", "8"))
 
 
 def read_settings():
@@ -162,7 +175,7 @@ def read_settings():
         c.close()
 
 
-def record(rid, origin, decision, code, start, query=None):
+def record(rid, origin, decision, code, start, query=None, username=None):
     settings = read_settings()
     store_text = ((decision == "BLOCK" and settings.log_blocked_queries)
                   or (decision == "ALLOW" and settings.log_allow_queries))
@@ -170,21 +183,64 @@ def record(rid, origin, decision, code, start, query=None):
     c = connect()
     try:
         with c:
-            c.execute("INSERT INTO events(ts,request_id,origin,decision,code,ms,query_text) VALUES(?,?,?,?,?,?,?)", (time.time(), rid, origin, decision, code, int((time.monotonic()-start)*1000), saved_query))
+            c.execute("INSERT INTO events(ts,request_id,origin,decision,code,ms,query_text,event_type,username) VALUES(?,?,?,?,?,?,?,?,?)", (time.time(), rid, origin, decision, code, int((time.monotonic()-start)*1000), saved_query, "SEARCH", username))
             c.execute("DELETE FROM events WHERE ts < ?", (time.time() - 30 * 86400,))
             c.execute("DELETE FROM events WHERE id <= COALESCE((SELECT MAX(id)-10000 FROM events),0)")
     finally:
         c.close()
 
 
-def admin(creds: HTTPBasicCredentials = Depends(basic)):
-    if not (secrets.compare_digest(creds.username.encode(), ADMIN.encode()) and secrets.compare_digest(creds.password.encode(), PASSWORD.encode())):
-        raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Basic"})
+def current_user(request: Request):
+    user = sessions.current(request.cookies.get(COOKIE_NAME))
+    if user is None:
+        raise HTTPException(401, "Authentication required")
+    return user
 
 
-def ui_write(request: Request):
-    if request.headers.get("x-guard-ui") != "1" or request.headers.get("content-type", "").split(";")[0] != "application/json":
+def ui_write(request: Request, user=Depends(current_user)):
+    if (request.headers.get("x-guard-ui") != "1"
+        or request.headers.get("content-type", "").split(";")[0] != "application/json"
+        or not secrets.compare_digest(request.headers.get("x-csrf-token", "").encode(), user.csrf_token.encode())):
+        raise HTTPException(403, "JSON, X-Guard-UI and valid CSRF token required")
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=512)
+
+
+def user_info(user):
+    return {"username": user.username, "is_admin": user.is_admin, "csrf_token": user.csrf_token}
+
+
+@app.post("/api/login")
+def login(payload: LoginRequest, request: Request):
+    if (request.headers.get("x-guard-ui") != "1"
+        or request.headers.get("content-type", "").split(";")[0] != "application/json"):
         raise HTTPException(403, "JSON and X-Guard-UI required")
+    try:
+        token, user = sessions.login(payload.username, payload.password)
+    except PermissionError:
+        raise HTTPException(401, "Invalid credentials")
+    response = JSONResponse(user_info(user))
+    response.set_cookie(COOKIE_NAME, token, max_age=sessions.ttl, httponly=True,
+                        secure=COOKIE_SECURE, samesite="strict", path="/")
+    return response
+
+
+@app.get("/api/me")
+def me(user=Depends(current_user)):
+    return user_info(user)
+
+
+@app.post("/api/logout", dependencies=[Depends(ui_write)])
+def logout(request: Request, user=Depends(current_user)):
+    sessions.logout(request.cookies.get(COOKIE_NAME))
+    response = JSONResponse({"logged_out": True})
+    response.delete_cookie(COOKIE_NAME, path="/", secure=COOKIE_SECURE,
+                           httponly=True, samesite="strict")
+    return response
 
 
 def proxy_auth(request: Request):
@@ -216,15 +272,15 @@ async def invalid(request, exc):
 
 @app.get("/healthz")
 def health():
-    return {"status": "alive", "version": "0.2.0"}
+    return {"status": "alive", "version": "0.3.0"}
 
 
-@app.get("/", dependencies=[Depends(admin)])
+@app.get("/")
 def index():
     return FileResponse(Path(__file__).with_name("index.html"))
 
 
-@app.get("/api/settings", dependencies=[Depends(admin)])
+@app.get("/api/settings", dependencies=[Depends(current_user)])
 def get_settings():
     s = read_settings()
     d = s.model_dump()
@@ -234,35 +290,49 @@ def get_settings():
     return d
 
 
-@app.post("/api/settings", dependencies=[Depends(admin), Depends(ui_write)])
-def set_settings(s: Settings):
-    old = read_settings()
-    for key in ("llm_key", "yandex_key"):
-        if not getattr(s, key):
-            setattr(s, key, getattr(old, key))
+@app.post("/api/settings", dependencies=[Depends(ui_write)])
+def set_settings(patch: dict, user=Depends(current_user)):
     c = connect()
     try:
         with c:
-            c.execute("INSERT INTO config(id,body) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body", (s.model_dump_json(),))
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT body FROM config WHERE id=1").fetchone()
+            old = Settings.model_validate_json(row[0]) if row else Settings()
+            try:
+                merged = merge_settings(old.model_dump(), patch, user.is_admin)
+                settings = Settings.model_validate(merged)
+            except PermissionError:
+                raise HTTPException(403, "Connection settings require administrator")
+            except ValueError:
+                raise HTTPException(422, "Invalid settings; values omitted")
+            c.execute("INSERT INTO config(id,body) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body", (settings.model_dump_json(),))
     finally:
         c.close()
     return {"saved": True}
 
 
-@app.get("/api/events", dependencies=[Depends(admin)])
-def events(decision: Literal["ALL", "BLOCK", "ALLOW", "ERROR"] = "ALL"):
+def filtered_events(decision, username, date_from, date_to, limit=None):
     cleanup_events()
-    c = connect()
     try:
-        return [dict(r) for r in c.execute(
-            "SELECT id,ts,request_id,origin,decision,code,ms,query_text FROM events WHERE (?='ALL' OR decision=?) ORDER BY id DESC LIMIT 200",
-            (decision, decision),
-        )]
-    finally:
-        c.close()
+        return event_rows(connect, decision, username, date_from, date_to, limit)
+    except ValueError:
+        raise HTTPException(422, "Invalid journal filter; dates use YYYY-MM-DD UTC")
 
 
-@app.post("/api/events/clear", dependencies=[Depends(admin), Depends(ui_write)])
+@app.get("/api/events", dependencies=[Depends(current_user)])
+def events(decision: str = "ALL", username: str = "", date_from: str = "", date_to: str = ""):
+    return filtered_events(decision, username, date_from, date_to, limit=200)
+
+
+@app.get("/api/events/export", dependencies=[Depends(current_user)])
+def export_events(decision: str = "ALL", username: str = "", date_from: str = "", date_to: str = ""):
+    rows = filtered_events(decision, username, date_from, date_to)
+    content = xlsx_bytes(rows)
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="search-guard-journal.xlsx"'})
+
+
+@app.post("/api/events/clear", dependencies=[Depends(current_user), Depends(ui_write)])
 def clear_events():
     c = connect()
     try:
@@ -421,11 +491,11 @@ async def forward_yandex(body, s):
         return result
 
 
-async def run_request(text, origin, body=None):
+async def run_request(text, origin, body=None, username=None):
     start = time.monotonic()
     rid = uuid.uuid4().hex
     def finish(decision, code):
-        record(rid, origin, decision, code, start, query=text)
+        record(rid, origin, decision, code, start, query=text, username=username)
         return {"decision": decision, "code": code, "request_id": rid, "ms": int((time.monotonic()-start)*1000)}
     try:
         await asyncio.wait_for(slots.acquire(), timeout=2)
@@ -453,9 +523,9 @@ async def run_request(text, origin, body=None):
         slots.release()
 
 
-@app.post("/api/test", dependencies=[Depends(admin), Depends(ui_write)])
-async def test(q: TestQuery):
-    _, _, verdict = await run_request(q.query, "test")
+@app.post("/api/test", dependencies=[Depends(current_user), Depends(ui_write)])
+async def test(q: TestQuery, user=Depends(current_user)):
+    _, _, verdict = await run_request(q.query, "test", username=user.username)
     return verdict
 
 
