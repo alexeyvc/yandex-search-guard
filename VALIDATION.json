@@ -1,16 +1,9 @@
 {
-  "python_syntax": "passed",
-  "rule_cases": 12,
-  "normalization_cases": 2,
-  "payload_rebuild_and_metadata_checks": "passed",
-  "duplicate_key_cases": 2,
-  "routing_cases": 7,
-  "audit_text_absence": "passed",
-  "integration_tests_packaged": 12,
-  "not_executed": [
-    "Docker build",
-    "FastAPI integration tests",
-    "live model API",
-    "live Yandex API"
-  ]
+  "version": "0.3.0",
+  "date": "2026-11-06",
+  "evidence_source": "user-provided host test output and health logs",
+  "host_tests": {"unit": 17, "http_integration": 18, "total": 35, "result": "OK", "elapsed_seconds": 0.372},
+  "host_health": {"http_status": 200, "status": "alive", "version": "0.3.0", "container": "healthy"},
+  "source_verification": "Uploaded file SHA-256 values verified; published app.py, index.html, guard_admin.py and init.py Git blob hashes matched the uploaded runtime export",
+  "limitations": ["Not an independently rerun CI result", "Tests use temporary databases and mocked external calls", "No claim of exhaustive browser, load, model-quality or live-provider validation", "Real env credentials and database contents are not part of the repository"]
 }
