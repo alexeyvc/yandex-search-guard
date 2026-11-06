@@ -15,7 +15,7 @@ RUN pip install \
     && chown guard:guard /data \
     && rm -rf /wheelhouse
 
-COPY app.py index.html ./
+COPY app.py guard_admin.py index.html ./
 
 USER guard
 

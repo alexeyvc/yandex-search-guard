@@ -7,6 +7,9 @@ services:
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Run python3 init.py}
       SEARCH_TOKEN: ${SEARCH_TOKEN:?Run python3 init.py}
+      GUARD_USERS_JSON: ${GUARD_USERS_JSON:-}
+      SESSION_HOURS: ${SESSION_HOURS:-8}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
     volumes: ["guard-data:/data"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     read_only: true
