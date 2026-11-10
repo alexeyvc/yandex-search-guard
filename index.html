@@ -4,7 +4,7 @@
 <style>
 body{font:16px system-ui;max-width:1150px;margin:30px auto;padding:0 20px;background:#101827;color:#dce7f7}section{background:#1c293c;padding:20px;margin:18px 0;border-radius:12px}h1,h2{color:#9acbff}label{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;background:#101827;color:#fff;border:1px solid #53647d;padding:10px;border-radius:5px}textarea{min-height:85px}button{background:#397dc6;color:white;padding:11px 16px;border:0;border-radius:5px;margin:5px;cursor:pointer}button:disabled{opacity:.5;cursor:wait}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;font-size:13px;text-align:left}td,th{border-bottom:1px solid #46556a;padding:6px}small{color:#b6c8dc}td:last-child{max-width:450px}td:last-child pre{max-height:280px;overflow:auto}fieldset{border:1px solid #53647d;border-radius:8px;margin:15px 0}fieldset:disabled{opacity:.65}.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.scroll{overflow:auto}[hidden]{display:none!important}
 </style>
-<h1>Yandex Search Guard 0.3.0</h1>
+<h1>Yandex Search Guard 0.3.1</h1>
 <p id="status" role="status"></p>
 <section id="login_section"><h2>Вход</h2><form id="login_form">
 <label>Логин<input id="login_name" autocomplete="username" required maxlength="64"></label>
@@ -50,16 +50,26 @@ body{font:16px system-ui;max-width:1150px;margin:30px auto;padding:0 20px;backgr
 <script>
 const el=id=>document.getElementById(id);
 const protectedFields=new Set(['llm_url','llm_model','llm_key','timeout','json_mode','yandex_key','folder_id','search_type','region']);
-let current=null,fields=[];
+let current=null,fields=[],generation=0;
 function status(text){el('status').textContent=text}
-function showLogin(){current=null;el('application').hidden=true;el('login_section').hidden=false;el('events').replaceChildren();el('verdict').textContent='';el('llm_key').value='';el('yandex_key').value=''}
+function checkGeneration(value){if(value!==generation){const error=Error('Сеанс изменился; повторите действие');error.name='StaleSessionError';throw error}}
+function showLogin(){
+ generation++;current=null;fields=[];
+ el('application').hidden=true;el('login_section').hidden=false;
+ el('settings_form').reset();el('connection_fields').disabled=true;
+ for(const id of ['identity','verdict','llm_key_set','yandex_key_set'])el(id).textContent='';
+ for(const id of ['query','username_filter','date_from','date_to'])el(id).value='';
+ el('decision_filter').value='ALL';el('events').replaceChildren();
+}
 async function request(path,body){
+ const epoch=generation;
  const headers=body===undefined?{}:{'Content-Type':'application/json','X-Guard-UI':'1','X-CSRF-Token':current?.csrf_token||''};
  const r=await fetch('.'+path,{method:body===undefined?'GET':'POST',headers,credentials:'same-origin',cache:'no-store',body:body===undefined?undefined:JSON.stringify(body)});
+ checkGeneration(epoch);
  if(!r.ok){if(r.status===401)showLogin();throw Error(r.status===401?'Войдите в панель или проверьте логин и пароль':'HTTP '+r.status)}
  return r;
 }
-async function api(path,body){return (await request(path,body)).json()}
+async function api(path,body){const epoch=generation,data=await (await request(path,body)).json();checkGeneration(epoch);return data}
 async function load(){
  const d=await api('/api/settings');fields=Object.keys(d).filter(k=>!k.endsWith('_set'));
  for(const k of fields){const n=el(k);if(n.type==='checkbox')n.checked=d[k];else n.value=Array.isArray(d[k])?d[k].join('\n'):d[k]}
@@ -81,14 +91,14 @@ async function refresh(){
   tr.appendChild(td);el('events').appendChild(tr);
  }
 }
-async function activate(user){current=user;el('identity').textContent=user.username+(user.is_admin?' — администратор':' — оператор');await load();await refresh();el('login_section').hidden=true;el('application').hidden=false;status('')}
+async function activate(user){generation++;current=user;el('identity').textContent=user.username+(user.is_admin?' — администратор':' — оператор');await load();await refresh();el('login_section').hidden=true;el('application').hidden=false;status('')}
 el('login_form').onsubmit=async e=>{e.preventDefault();el('login_button').disabled=true;try{await activate(await api('/api/login',{username:el('login_name').value,password:el('login_password').value}))}catch(e){status(e.message)}finally{el('login_password').value='';el('login_button').disabled=false}};
 el('logout').onclick=async()=>{try{await api('/api/logout',{});showLogin();status('Вы вышли из панели')}catch(e){status(e.message)}};
 el('settings_form').onsubmit=async e=>{e.preventDefault();try{const d={};for(const k of fields){if(!current.is_admin&&protectedFields.has(k))continue;const n=el(k);d[k]=n.type==='checkbox'?n.checked:n.value}for(const k of ['internal_domains','blocked_terms'])d[k]=d[k].split('\n').map(x=>x.trim()).filter(Boolean);if('timeout'in d)d.timeout=Number(d.timeout);await api('/api/settings',d);await load();status('Сохранено')}catch(e){status(e.message)}};
 el('test').onclick=async()=>{el('test').disabled=true;try{el('verdict').textContent=JSON.stringify(await api('/api/test',{query:el('query').value}),null,2);await refresh()}catch(e){status(e.message)}finally{el('test').disabled=false}};
 el('refresh').onclick=()=>refresh().catch(e=>status(e.message));
 for(const id of ['decision_filter','username_filter','date_from','date_to'])el(id).onchange=()=>refresh().catch(e=>status(e.message));
-el('export').onclick=async()=>{el('export').disabled=true;try{const response=await request('/api/events/export?'+filterQuery()),blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='search-guard-journal.xlsx';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);status('Экспорт подготовлен по текущему фильтру')}catch(e){status(e.message)}finally{el('export').disabled=false}};
+el('export').onclick=async()=>{const epoch=generation;el('export').disabled=true;try{const response=await request('/api/events/export?'+filterQuery()),blob=await response.blob();checkGeneration(epoch);const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='search-guard-journal.xlsx';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);status('Экспорт подготовлен по текущему фильтру')}catch(e){status(e.message)}finally{el('export').disabled=false}};
 el('clear').onclick=async()=>{if(confirm('Удалить весь журнал, включая события входа? Фильтр не ограничивает очистку.'))try{await api('/api/events/clear',{});await refresh()}catch(e){status(e.message)}};
-api('/api/me').then(activate).catch(e=>{showLogin();status(e.message)});
+api('/api/me').then(activate).catch(e=>{if(e.name==='StaleSessionError')return;showLogin();status(e.message)});
 </script></html>

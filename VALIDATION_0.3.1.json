@@ -1,0 +1,14 @@
+{
+  "version": "0.3.1",
+  "date": "2026-11-10",
+  "status": "partial_validation_pending_full_http_and_host_checks",
+  "base_commit": "a36c46e8f9e9fd5413cd17a10d7fb1e0343cec9c",
+  "backend_commit": "79b5239bde0c1616130d7f79795843181287a38d",
+  "python_executed": {"existing_unit": 17, "new_isolated_regressions": 6, "total": 23, "result": "OK"},
+  "javascript": {"runtime": "Node.js v20.20.1", "mocked_checks": 5, "result": "OK", "real_browser": false},
+  "http_suite": {"existing_tests": 18, "new_tests": 2, "executed": false, "reason": "FastAPI is not installed in the preparation environment"},
+  "python_suite_total": 43,
+  "not_verified": ["Docker build", "Full HTTP suite", "Real browser", "Live model and Yandex calls", "Host health for 0.3.1"],
+  "historical_validation": "VALIDATION.json remains the user-provided 0.3.0 host result; it is not a 0.3.1 test result",
+  "deployment": "No host, env or database changes performed during preparation"
+}
