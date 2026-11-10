@@ -70,7 +70,14 @@ class Settings(BaseModel):
             raise ValueError("Expected HTTP(S) API base without credentials/query/fragment")
         return v.rstrip("/")
 
-    @field_validator("folder_id", "region", "llm_model")
+    @field_validator("folder_id")
+    @classmethod
+    def folder(cls, v):
+        if len(v) > 50 or any(ord(x) < 32 for x in v):
+            raise ValueError("folderId must have at most 50 characters")
+        return v.strip()
+
+    @field_validator("region", "llm_model")
     @classmethod
     def short(cls, v):
         if len(v) > 256 or any(ord(x) < 32 for x in v):
@@ -122,7 +129,7 @@ async def journal_lifespan(application):
         with suppress(asyncio.CancelledError):
             await task
 
-app = FastAPI(lifespan=journal_lifespan, title="Yandex Search Guard", version="0.3.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(lifespan=journal_lifespan, title="Yandex Search Guard", version="0.3.1", docs_url=None, redoc_url=None, openapi_url=None)
 slots = asyncio.Semaphore(4)
 
 
@@ -272,7 +279,7 @@ async def invalid(request, exc):
 
 @app.get("/healthz")
 def health():
-    return {"status": "alive", "version": "0.3.0"}
+    return {"status": "alive", "version": "0.3.1"}
 
 
 @app.get("/")

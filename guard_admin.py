@@ -159,7 +159,11 @@ def event_rows(connect, decision="ALL", username="", date_from="", date_to="", l
             clauses.append("ts>=?"); args.append(value.timestamp())
         else:
             end = value
-            clauses.append("ts<?"); args.append((value+timedelta(days=1)).timestamp())
+            try:
+                exclusive_end = value + timedelta(days=1)
+            except OverflowError as exc:
+                raise ValueError("End date is outside supported range") from exc
+            clauses.append("ts<?"); args.append(exclusive_end.timestamp())
     if start and end and start > end:
         raise ValueError("Invalid date interval")
     sql = "SELECT id,ts,request_id,origin,decision,code,ms,query_text,event_type,username FROM events"
