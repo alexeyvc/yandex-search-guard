@@ -45,95 +45,6 @@ class User:
     csrf_token: str
 
 
-class Sessions:
-    def __init__(self, connect, admin_user, admin_password, users_json="", hours=8):
-        additional = json.loads(users_json or "{}", object_pairs_hook=_object)
-        if not isinstance(additional, dict) or admin_user in additional:
-            raise ValueError("Invalid additional accounts")
-        users = {admin_user: admin_password, **additional}
-        if len(users) > 100:
-            raise ValueError("At most 100 accounts")
-        for login, password in users.items():
-            if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", login):
-                raise ValueError("Invalid account name")
-            if not isinstance(password, str) or not 24 <= len(password) <= 512:
-                raise ValueError("Account passwords must have 24..512 characters")
-        if not 1 <= int(hours) <= 168:
-            raise ValueError("SESSION_HOURS must be 1..168")
-        self.connect, self.admin_user, self.users = connect, admin_user, users
-        self.ttl = int(hours) * 3600
-        c = connect()
-        try:
-            with c:
-                c.execute("""CREATE TABLE IF NOT EXISTS ui_sessions(
-                    token_hash TEXT PRIMARY KEY, username TEXT NOT NULL,
-                    expires REAL NOT NULL, csrf_token TEXT NOT NULL,
-                    credential_tag TEXT NOT NULL)""")
-                c.execute("DELETE FROM ui_sessions WHERE expires <= ?", (time.time(),))
-        finally:
-            c.close()
-
-    @staticmethod
-    def token_hash(token):
-        return hashlib.sha256(token.encode()).hexdigest()
-
-    def tag(self, username, token_hash):
-        return hmac.new(self.users[username].encode(), token_hash.encode(), hashlib.sha256).hexdigest()
-
-    def login(self, username, password):
-        expected = self.users.get(username, "not-an-account-password")
-        matches = secrets.compare_digest(hashlib.sha256(password.encode()).digest(),
-                                         hashlib.sha256(expected.encode()).digest())
-        if not matches or username not in self.users:
-            raise PermissionError("Invalid credentials")
-        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        token_hash, now = self.token_hash(token), time.time()
-        c = self.connect()
-        try:
-            with c:
-                c.execute("DELETE FROM ui_sessions WHERE expires <= ?", (now,))
-                c.execute("INSERT INTO ui_sessions VALUES(?,?,?,?,?)",
-                          (token_hash, username, now+self.ttl, csrf, self.tag(username, token_hash)))
-                c.execute("""INSERT INTO events(ts,request_id,origin,decision,code,ms,
-                             query_text,event_type,username) VALUES(?,?,?,?,?,?,?,?,?)""",
-                          (now, uuid.uuid4().hex, "auth", "ALLOW", "LOGIN_SUCCESS", 0,
-                           None, "AUTH", username))
-                c.execute("DELETE FROM events WHERE ts < ?", (now-30*86400,))
-                c.execute("DELETE FROM events WHERE id <= COALESCE((SELECT MAX(id)-10000 FROM events),0)")
-        finally:
-            c.close()
-        return token, User(username, username == self.admin_user, csrf)
-
-    def current(self, token):
-        if not isinstance(token, str) or not 20 <= len(token) <= 256:
-            return None
-        digest = self.token_hash(token)
-        c = self.connect()
-        try:
-            row = c.execute("SELECT * FROM ui_sessions WHERE token_hash=?", (digest,)).fetchone()
-            if not row:
-                return None
-            valid = (row["expires"] > time.time() and row["username"] in self.users)
-            if valid:
-                valid = secrets.compare_digest(row["credential_tag"], self.tag(row["username"], digest))
-            if not valid:
-                with c:
-                    c.execute("DELETE FROM ui_sessions WHERE token_hash=?", (digest,))
-                return None
-            return User(row["username"], row["username"] == self.admin_user, row["csrf_token"])
-        finally:
-            c.close()
-
-    def logout(self, token):
-        if not token:
-            return
-        c = self.connect()
-        try:
-            with c:
-                c.execute("DELETE FROM ui_sessions WHERE token_hash=?", (self.token_hash(token),))
-        finally:
-            c.close()
-
 
 def event_rows(connect, decision="ALL", username="", date_from="", date_to="", limit=None):
     if decision not in FILTERS or len(username) > 64:
@@ -166,7 +77,7 @@ def event_rows(connect, decision="ALL", username="", date_from="", date_to="", l
             clauses.append("ts<?"); args.append(exclusive_end.timestamp())
     if start and end and start > end:
         raise ValueError("Invalid date interval")
-    sql = "SELECT id,ts,request_id,origin,decision,code,ms,query_text,event_type,username FROM events"
+    sql = "SELECT id,ts,request_id,origin,decision,code,ms,query_text,event_type,username,model_decision,model_flags,model_status FROM events"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY id DESC"
@@ -190,7 +101,7 @@ def _xml_text(value):
 
 def xlsx_bytes(rows):
     headers = ["Дата/время UTC", "Тип события", "Логин", "Источник", "Решение",
-               "Код", "Длительность, мс", "ID запроса", "Текст запроса"]
+               "Код", "Длительность, мс", "ID запроса", "Текст запроса", "Проверка модели", "Флаги модели", "Вердикт модели (история)"]
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
@@ -208,6 +119,7 @@ def xlsx_bytes(rows):
             for number, row in enumerate(rows, 2):
                 timestamp = datetime.fromtimestamp(row['ts'], timezone.utc).isoformat(timespec='seconds')
                 write_row(number, [timestamp, row['event_type'], row['username'], row['origin'],
-                                   row['decision'], row['code'], row['ms'], row['request_id'], row['query_text']])
-            sheet.write(f'</sheetData><autoFilter ref="A1:I{len(rows)+1}"/></worksheet>'.encode())
+                                   row['decision'], row['code'], row['ms'], row['request_id'], row['query_text'], row.get('model_status') or ('legacy' if row.get('model_decision') or row.get('model_flags') else 'not_checked'), row.get('model_flags'), row.get('model_decision')])
+            sheet.write(f'</sheetData><autoFilter ref="A1:L{len(rows)+1}"/></worksheet>'.encode())
     return output.getvalue()
+
